@@ -32,8 +32,8 @@ import type {
 } from '@modelcontextprotocol/core-internal';
 import { codecForVersion, MODERN_WIRE_REVISION, SERVER_INFO_META_KEY, SUBSCRIPTION_ID_META_KEY } from '@modelcontextprotocol/core-internal';
 
-import type { ServerEventBus } from './serverEventBus';
-import { honoredSubset, listenFilterAccepts, serverEventToNotification } from './serverEventBus';
+import type { ListenExtension, ServerEvent, ServerEventBus } from './serverEventBus';
+import { CORE_CHANGE_NOTIFICATION_METHODS, honoredListenFilter, listenAccepts, serverEventToNotification } from './serverEventBus';
 import { armSseKeepAlive, DEFAULT_SSE_KEEP_ALIVE_MS } from './sseKeepAlive';
 
 /** Default capacity guard: refuse a new subscription when this many are already open. */
@@ -49,6 +49,8 @@ export interface ListenRouterOptions {
     keepAliveMs?: number;
     /** Out-of-band error reporting (never alters the response). */
     onerror?: (error: Error) => void;
+    /** Extensions whose filter fields and notifications listen streams also carry. */
+    extensions?: readonly ListenExtension[];
 }
 
 /**
@@ -91,6 +93,14 @@ export function parseListenFilter(message: JSONRPCRequest): SubscriptionFilter |
     return outcome.ok ? outcome.value.params?.notifications : undefined;
 }
 
+/** The filter exactly as requested, extension fields included (the wire schema keeps only the core ones). */
+function requestedFilterOf(message: JSONRPCRequest): Readonly<Record<string, unknown>> {
+    const notifications = (message.params as { notifications?: unknown } | undefined)?.notifications;
+    return typeof notifications === 'object' && notifications !== null && !Array.isArray(notifications)
+        ? (notifications as Record<string, unknown>)
+        : {};
+}
+
 /**
  * The HTTP listen router: holds the set of open subscriptions and serves
  * each listen request as an SSE response.
@@ -121,6 +131,7 @@ export interface ListenRouter {
 
 export function createListenRouter(options: ListenRouterOptions): ListenRouter {
     const { bus, onerror } = options;
+    const extensions = options.extensions ?? [];
     const maxSubscriptions = options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS;
     const keepAliveMs = options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS;
 
@@ -141,7 +152,7 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
         if (filter === undefined) {
             return jsonRpcError(message.id, -32_602, "Invalid params: 'notifications' is required and must be a valid SubscriptionFilter");
         }
-        const honored = honoredSubset(filter, capabilities);
+        const honored = honoredListenFilter(requestedFilterOf(message), filter, capabilities, extensions);
         // The spec carries the listen request's JSON-RPC id verbatim as the
         // subscription id; demux is per-connection (each HTTP listen has its
         // own SSE stream) so client-chosen ids cannot route across requests.
@@ -221,7 +232,7 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
 
                 // Only after the ack frame is enqueued does delivery activate.
                 unsubscribe = bus.subscribe(event => {
-                    if (closed || !listenFilterAccepts(honored, event)) return;
+                    if (closed || !listenAccepts(honored, event, extensions)) return;
                     const note = stampSubscriptionId(serverEventToNotification(event), subscriptionId);
                     writeNotification(note.method, note.params);
                 });
@@ -284,13 +295,6 @@ export interface ListenCloseFrame {
     };
 }
 
-const CHANGE_NOTIFICATION_METHODS: ReadonlySet<string> = new Set([
-    'notifications/tools/list_changed',
-    'notifications/prompts/list_changed',
-    'notifications/resources/list_changed',
-    'notifications/resources/updated'
-]);
-
 /**
  * Per-connection listen state for the stdio entry. One instance is held by
  * `serveStdio` for the connection lifetime; it routes inbound
@@ -301,7 +305,7 @@ const CHANGE_NOTIFICATION_METHODS: ReadonlySet<string> = new Set([
  */
 export class StdioListenRouter {
     /** Active subscriptions, keyed by the listen request's JSON-RPC id verbatim. */
-    private readonly _subs = new Map<RequestId, SubscriptionFilter>();
+    private readonly _subs = new Map<RequestId, SubscriptionFilter & Record<string, unknown>>();
     /**
      * The serving instance's declared capabilities. Filled in by the entry
      * once the modern instance is constructed (the router is created before
@@ -319,7 +323,8 @@ export class StdioListenRouter {
     constructor(
         private readonly _maxSubscriptions: number = DEFAULT_MAX_SUBSCRIPTIONS,
         serverCapabilities?: ServerCapabilities,
-        serverInfo?: Implementation
+        serverInfo?: Implementation,
+        private readonly _extensions: readonly ListenExtension[] = []
     ) {
         this._serverCapabilities = serverCapabilities;
         this._serverInfo = serverInfo;
@@ -369,7 +374,7 @@ export class StdioListenRouter {
                 error: { code: -32_602, message: "Invalid params: 'notifications' is required and must be a valid SubscriptionFilter" }
             };
         }
-        const honored = honoredSubset(filter, this._serverCapabilities);
+        const honored = honoredListenFilter(requestedFilterOf(message), filter, this._serverCapabilities, this._extensions);
         this._subs.set(message.id, honored);
         return stampSubscriptionId({ method: 'notifications/subscriptions/acknowledged', params: { notifications: honored } }, message.id);
     }
@@ -386,22 +391,26 @@ export class StdioListenRouter {
     /**
      * Route an outbound notification through the active subscriptions.
      *
-     * - For a subscription-gated change notification, returns one stamped copy
-     *   per subscription that opted in to it (an empty array means it is
-     *   dropped — the modern era never delivers an un-requested change type).
+     * - For a subscription-gated change notification, or a notification a
+     *   listen extension owns, returns one stamped copy per subscription that
+     *   opted in to it (an empty array means it is dropped — the modern era
+     *   never delivers an un-requested change type).
      * - For any other outbound message, returns `'passthrough'` (the entry
      *   forwards it as-is).
      */
     routeOutbound(message: { method: string; params?: { [key: string]: unknown } }): NotificationBody[] | 'passthrough' {
-        if (!CHANGE_NOTIFICATION_METHODS.has(message.method)) {
+        let event: ServerEvent;
+        if (CORE_CHANGE_NOTIFICATION_METHODS.has(message.method)) {
+            const uriParam: unknown = message.params?.['uri'];
+            event = notificationToServerEvent(message.method, typeof uriParam === 'string' ? uriParam : undefined);
+        } else if (this._extensions.some(extension => extension.methods.includes(message.method))) {
+            event = { kind: 'extension', method: message.method, ...(message.params !== undefined && { params: message.params }) };
+        } else {
             return 'passthrough';
         }
-        const uriParam: unknown = message.params?.['uri'];
-        const uri = typeof uriParam === 'string' ? uriParam : undefined;
-        const event = notificationToServerEvent(message.method, uri);
         const out: NotificationBody[] = [];
         for (const [subscriptionId, filter] of this._subs) {
-            if (listenFilterAccepts(filter, event)) {
+            if (listenAccepts(filter, event, this._extensions)) {
                 out.push(stampSubscriptionId({ method: message.method, params: message.params ?? {} }, subscriptionId));
             }
         }
@@ -435,7 +444,7 @@ export class StdioListenRouter {
     }
 }
 
-function notificationToServerEvent(method: string, uri: string | undefined): import('./serverEventBus').ServerEvent {
+function notificationToServerEvent(method: string, uri: string | undefined): ServerEvent {
     switch (method) {
         case 'notifications/tools/list_changed': {
             return { kind: 'tools_list_changed' };

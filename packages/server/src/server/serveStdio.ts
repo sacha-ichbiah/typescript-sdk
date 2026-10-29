@@ -79,6 +79,8 @@ import { DEFAULT_MAX_SUBSCRIPTIONS, StdioListenRouter } from './listenRouter';
 import { McpServer } from './mcp';
 import type { Server } from './server';
 import { installModernOnlyHandlers, serverIdentityOf } from './server';
+import type { ListenExtension } from './serverEventBus';
+import { assertListenExtensions } from './serverEventBus';
 import { StdioServerTransport } from './stdio';
 
 /** Options for {@linkcode serveStdio}. */
@@ -114,6 +116,14 @@ export interface ServeStdioOptions {
      * @default 1024
      */
     maxSubscriptions?: number;
+    /**
+     * Extensions whose `subscriptions/listen` filter fields and notifications
+     * this connection also serves, for example the Tasks extension's `taskIds`.
+     * The pinned instance sends an extension's notifications as usual. Each
+     * method may have one owner, and no extension may own a core change
+     * notification.
+     */
+    listenExtensions?: readonly ListenExtension[];
 }
 
 /** The handle returned by {@linkcode serveStdio}. */
@@ -374,6 +384,7 @@ type EntryState =
  */
 export function serveStdio(factory: McpServerFactory, options: ServeStdioOptions = {}): StdioServerHandle {
     const legacyMode = options.legacy ?? 'serve';
+    assertListenExtensions(options.listenExtensions ?? []);
     const wire = options.transport ?? new StdioServerTransport();
 
     let state: EntryState = { phase: 'opening' };
@@ -411,7 +422,12 @@ export function serveStdio(factory: McpServerFactory, options: ServeStdioOptions
      * change notifications pass straight through (the 2025 unsolicited
      * delivery model is unchanged).
      */
-    const listenRouter = new StdioListenRouter(options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS);
+    const listenRouter = new StdioListenRouter(
+        options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS,
+        undefined,
+        undefined,
+        options.listenExtensions
+    );
 
     /** Outbound intercept installed on a modern instance's channel. */
     const modernOutboundIntercept = (message: JSONRPCMessage): 'handled' | undefined => {

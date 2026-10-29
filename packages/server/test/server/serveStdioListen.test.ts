@@ -21,6 +21,7 @@ import * as z from 'zod/v4';
 import { StdioListenRouter } from '../../src/server/listenRouter';
 import { McpServer } from '../../src/server/mcp';
 import { serveStdio } from '../../src/server/serveStdio';
+import type { ListenExtension } from '../../src/server/serverEventBus';
 
 const ENVELOPE = {
     [PROTOCOL_VERSION_META_KEY]: '2026-07-28',
@@ -32,7 +33,7 @@ function listenReq(id: number | string, filter: Record<string, unknown>): JSONRP
     return { jsonrpc: '2.0', id, method: 'subscriptions/listen', params: { _meta: ENVELOPE, notifications: filter } };
 }
 
-async function bootModern(options?: { maxSubscriptions?: number }) {
+async function bootModern(options?: { maxSubscriptions?: number; listenExtensions?: readonly ListenExtension[] }) {
     const [peerTx, wireTx] = InMemoryTransport.createLinkedPair();
     const inbound: JSONRPCMessage[] = [];
     peerTx.onmessage = m => inbound.push(m);
@@ -245,5 +246,47 @@ describe('StdioListenRouter — capability gate', () => {
             method: 'notifications/subscriptions/acknowledged',
             params: { notifications: { toolsListChanged: true } }
         });
+    });
+});
+
+describe('StdioListenRouter — listen extensions', () => {
+    const tasksListen: ListenExtension = {
+        methods: ['notifications/tasks'],
+        honor: requested => (Array.isArray(requested.taskIds) ? { taskIds: requested.taskIds } : undefined),
+        accepts: (honored, notification) => Array.isArray(honored.taskIds) && honored.taskIds.includes(notification.params?.taskId)
+    };
+
+    it('acknowledges extension fields and routes owned notifications by them', () => {
+        const router = new StdioListenRouter(undefined, { tools: { listChanged: true } }, undefined, [tasksListen]);
+        expect(router.serve(listenReq(1, { toolsListChanged: true, taskIds: ['t1'] }))).toMatchObject({
+            params: { notifications: { toolsListChanged: true, taskIds: ['t1'] } }
+        });
+        router.serve(listenReq(2, { taskIds: ['t2'] }));
+
+        expect(router.routeOutbound({ method: 'notifications/tasks', params: { taskId: 't1' } })).toEqual([
+            { method: 'notifications/tasks', params: { taskId: 't1', _meta: { [SUBSCRIPTION_ID_META_KEY]: 1 } } }
+        ]);
+        expect(router.routeOutbound({ method: 'notifications/tasks', params: { taskId: 't3' } })).toEqual([]);
+        expect(router.routeOutbound({ method: 'notifications/message', params: { level: 'info', data: 'x' } })).toBe('passthrough');
+    });
+
+    it("serveStdio routes the pinned instance's extension notifications to the subscriptions that accept them", async () => {
+        const { handle, server, inbound, send, flush } = await bootModern({ listenExtensions: [tasksListen] });
+        await send(listenReq(1, { taskIds: ['t1'] }));
+        await send(listenReq(2, { taskIds: ['t2'] }));
+        await flush();
+        inbound.length = 0;
+        await server().server.notification({ method: 'notifications/tasks', params: { taskId: 't1' } });
+        await flush();
+        expect(inbound).toEqual([
+            { jsonrpc: '2.0', method: 'notifications/tasks', params: { taskId: 't1', _meta: { [SUBSCRIPTION_ID_META_KEY]: 1 } } }
+        ]);
+        await handle.close();
+    });
+
+    it('passes an extension notification through when no extension owns it', () => {
+        const router = new StdioListenRouter(undefined, { tools: { listChanged: true } });
+        router.serve(listenReq(1, { toolsListChanged: true, taskIds: ['t1'] }));
+        expect(router.routeOutbound({ method: 'notifications/tasks', params: { taskId: 't1' } })).toBe('passthrough');
     });
 });

@@ -67,8 +67,8 @@ import { DEFAULT_MAX_REQUEST_BODY_SIZE, readRequestBody, requestBodyTooLargeMess
 import { createScopeChallengeResponse, findScopeChallenge, scopeChallengeResourceMetadataUrl } from './scopeChallenge';
 import type { Server } from './server';
 import { installModernOnlyHandlers, seedClientIdentityFromEnvelope, serverIdentityOf } from './server';
-import type { ServerEventBus, ServerNotifier } from './serverEventBus';
-import { createServerNotifier, InMemoryServerEventBus } from './serverEventBus';
+import type { ListenExtension, ServerEventBus, ServerNotifier } from './serverEventBus';
+import { assertListenExtensions, createServerNotifier, InMemoryServerEventBus } from './serverEventBus';
 import { DEFAULT_SSE_KEEP_ALIVE_MS } from './sseKeepAlive';
 import { WebStandardStreamableHTTPServerTransport } from './streamableHttp';
 
@@ -197,6 +197,14 @@ export interface CreateMcpHandlerOptions {
      * @default 1024
      */
     maxSubscriptions?: number;
+    /**
+     * Extensions whose `subscriptions/listen` filter fields and notifications
+     * this handler also serves, for example the Tasks extension's `taskIds`.
+     * Publish an extension's notification as a `{ kind: 'extension', method,
+     * params }` event. Each method may have one owner, and no extension may
+     * own a core change notification.
+     */
+    listenExtensions?: readonly ListenExtension[];
     /**
      * SSE comment-frame keepalive interval for every SSE stream this handler
      * serves. In modern `auto` mode it starts after SSE upgrade. Set to `0` to disable.
@@ -707,8 +715,10 @@ export function createMcpHandler(factory: McpServerFactory, options: CreateMcpHa
 
     const bus: ServerEventBus = options.bus ?? new InMemoryServerEventBus(reportError);
     const notify = createServerNotifier(bus);
+    assertListenExtensions(options.listenExtensions ?? []);
     const listenRouter = createListenRouter({
         bus,
+        ...(options.listenExtensions !== undefined && { extensions: options.listenExtensions }),
         maxSubscriptions: options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS,
         keepAliveMs: options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS,
         onerror: reportError

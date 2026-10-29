@@ -104,6 +104,10 @@ The in-memory bus never leaves the process, so one process needs nothing more. R
 
 When forwarding another server's notifications, include their params on the event: `bus.publish({ kind: 'tools_list_changed', params: notification.params })`. The router preserves custom `_meta` and extension params while replacing the subscription ID with the receiving stream's ID. For `resource_updated`, the event's `uri` controls both filtering and the delivered URI.
 
+## Deliver an extension's notifications
+
+An extension can add its own fields to the `subscriptions/listen` filter, such as the Tasks extension's `taskIds`. Pass a `ListenExtension` for it as `listenExtensions` to `createMcpHandler` or `serveStdio`: `methods` names the notifications it owns, `honor` returns the fields of the requested filter your server acknowledges, and `accepts` decides whether one of its notifications reaches a stream with that acknowledged filter. Behind `createMcpHandler`, publish one as `bus.publish({ kind: 'extension', method, params })`; on stdio, the instance sends it as usual. Without a `ListenExtension`, the extension's fields are left out of the acknowledgement and its notifications are not delivered on a listen stream.
+
 ## Recap
 
 - `sendToolListChanged()`, `sendPromptListChanged()`, and `sendResourceListChanged()` push a list-changed notification to connected clients.

@@ -8,6 +8,7 @@ import type { JSONRPCNotification, ServerCapabilities, SubscriptionFilter } from
  * - `prompts_list_changed` → `notifications/prompts/list_changed`
  * - `resources_list_changed` → `notifications/resources/list_changed`
  * - `resource_updated` → `notifications/resources/updated` (carries the URI)
+ * - `extension` → `method`, a notification owned by a {@linkcode ListenExtension}
  *
  * The bus carries the event and any forwarded notification params — the
  * entry's listen router owns subscription-id stamping and per-stream filtering.
@@ -17,6 +18,7 @@ export type ServerEvent = (
     | { kind: 'prompts_list_changed' }
     | { kind: 'resources_list_changed' }
     | { kind: 'resource_updated'; uri: string }
+    | { kind: 'extension'; method: string }
 ) & {
     /** Forwarded notification params; the router stamps its own subscription ID and the event's resource URI. */
     params?: JSONRPCNotification['params'];
@@ -142,7 +144,92 @@ export function listenFilterAccepts(filter: SubscriptionFilter, event: ServerEve
         case 'resource_updated': {
             return filter.resourceSubscriptions !== undefined && filter.resourceSubscriptions.includes(event.uri);
         }
+        case 'extension': {
+            return false;
+        }
     }
+}
+
+/**
+ * An extension's part in `subscriptions/listen`: the notification methods it
+ * owns and the filter fields that opt a stream in to them. Pass it to
+ * `createMcpHandler` or `serveStdio` as `listenExtensions`.
+ *
+ * Its fields sit next to the spec's own in the request's `notifications`
+ * filter. The acknowledgement carries what {@linkcode ListenExtension.honor}
+ * returns, and a notification it owns reaches a stream only when
+ * {@linkcode ListenExtension.accepts} says so.
+ */
+export interface ListenExtension {
+    /** The notification methods this extension owns, for example `notifications/tasks`. */
+    methods: readonly string[];
+    /**
+     * The extension's fields of the requested filter that this server honors,
+     * given its capabilities, or `undefined` to honor none.
+     */
+    honor(requested: Readonly<Record<string, unknown>>, capabilities: ServerCapabilities): Record<string, unknown> | undefined;
+    /** Whether one of the extension's notifications reaches a stream with this acknowledged filter. */
+    accepts(honored: Readonly<Record<string, unknown>>, notification: { method: string; params?: JSONRPCNotification['params'] }): boolean;
+}
+
+const CORE_FILTER_FIELDS: ReadonlySet<string> = new Set([
+    'toolsListChanged',
+    'promptsListChanged',
+    'resourcesListChanged',
+    'resourceSubscriptions'
+]);
+
+/** The core notification methods `subscriptions/listen` filters itself; no extension may own one. */
+export const CORE_CHANGE_NOTIFICATION_METHODS: ReadonlySet<string> = new Set([
+    'notifications/tools/list_changed',
+    'notifications/prompts/list_changed',
+    'notifications/resources/list_changed',
+    'notifications/resources/updated'
+]);
+
+/** Throws when two extensions own the same method, or one owns a core change notification. */
+export function assertListenExtensions(extensions: readonly ListenExtension[]): void {
+    const owned = new Set<string>();
+    for (const extension of extensions) {
+        for (const method of extension.methods) {
+            if (CORE_CHANGE_NOTIFICATION_METHODS.has(method) || owned.has(method)) {
+                throw new Error(`listenExtensions: ${method} is already owned`);
+            }
+            owned.add(method);
+        }
+    }
+}
+
+/**
+ * The acknowledged filter: the honored core subset plus every extension's
+ * honored fields. An extension cannot honor a core field.
+ */
+export function honoredListenFilter(
+    requested: Readonly<Record<string, unknown>>,
+    core: SubscriptionFilter,
+    capabilities: ServerCapabilities,
+    extensions: readonly ListenExtension[]
+): SubscriptionFilter & Record<string, unknown> {
+    const honored: SubscriptionFilter & Record<string, unknown> = { ...honoredSubset(core, capabilities) };
+    for (const extension of extensions) {
+        for (const [key, value] of Object.entries(extension.honor(requested, capabilities) ?? {})) {
+            if (!CORE_FILTER_FIELDS.has(key)) honored[key] = value;
+        }
+    }
+    return honored;
+}
+
+/** Whether a stream with this acknowledged filter receives the event, core or extension. */
+export function listenAccepts(
+    honored: SubscriptionFilter & Readonly<Record<string, unknown>>,
+    event: ServerEvent,
+    extensions: readonly ListenExtension[]
+): boolean {
+    if (event.kind !== 'extension') return listenFilterAccepts(honored, event);
+    const owner = extensions.find(extension => extension.methods.includes(event.method));
+    return (
+        owner !== undefined && owner.accepts(honored, { method: event.method, ...(event.params !== undefined && { params: event.params }) })
+    );
 }
 
 /**
@@ -193,6 +280,9 @@ export function serverEventToNotification(event: ServerEvent): { method: string;
         }
         case 'resource_updated': {
             return { method: 'notifications/resources/updated', params: { ...event.params, uri: event.uri } };
+        }
+        case 'extension': {
+            return { method: event.method, ...(event.params !== undefined && { params: event.params }) };
         }
     }
 }

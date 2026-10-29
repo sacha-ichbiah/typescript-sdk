@@ -17,7 +17,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createMcpHandler } from '../../src/server/createMcpHandler';
 import { McpServer } from '../../src/server/mcp';
-import type { ServerEventBus } from '../../src/server/serverEventBus';
+import type { ListenExtension, ServerEventBus } from '../../src/server/serverEventBus';
 
 const MODERN_REVISION = '2026-07-28';
 const ENVELOPE = {
@@ -340,5 +340,65 @@ describe('createMcpHandler — subscriptions/listen', () => {
         expect(text).not.toContain('notifications/subscriptions/acknowledged');
         expect(text).toContain('-32601');
         await handler.close();
+    });
+});
+
+const TASKS_EXTENSION_ID = 'io.modelcontextprotocol/tasks';
+const tasksListen: ListenExtension = {
+    methods: ['notifications/tasks'],
+    honor: (requested, capabilities) =>
+        Array.isArray(requested.taskIds) && capabilities.extensions?.[TASKS_EXTENSION_ID] !== undefined
+            ? { taskIds: requested.taskIds.filter(id => typeof id === 'string') }
+            : undefined,
+    accepts: (honored, notification) => Array.isArray(honored.taskIds) && honored.taskIds.includes(notification.params?.taskId)
+};
+
+function tasksFactory(advertised: boolean): () => McpServer {
+    return () =>
+        new McpServer(
+            { name: 'listen-test-server', version: '1.0.0' },
+            { capabilities: { tools: { listChanged: true }, ...(advertised && { extensions: { [TASKS_EXTENSION_ID]: {} } }) } }
+        );
+}
+
+describe('createMcpHandler — subscriptions/listen extensions', () => {
+    it('acknowledges extension fields and delivers only the notifications they accept', async () => {
+        const handler = createMcpHandler(tasksFactory(true), { keepAliveMs: 0, listenExtensions: [tasksListen] });
+        const response = await handler.fetch(listenRequest(9, { toolsListChanged: true, taskIds: ['t1'] }));
+        handler.bus.publish({ kind: 'extension', method: 'notifications/tasks', params: { taskId: 't2' } });
+        handler.bus.publish({ kind: 'extension', method: 'notifications/unowned', params: { taskId: 't1' } });
+        handler.bus.publish({ kind: 'extension', method: 'notifications/tasks', params: { taskId: 't1' } });
+        handler.notify.toolsChanged();
+        const messages = (await readMessages(response, 3)) as { method: string; params: Record<string, unknown> }[];
+        expect(messages[0]!.params['notifications']).toEqual({ toolsListChanged: true, taskIds: ['t1'] });
+        expect(messages.map(m => m.method)).toEqual([
+            'notifications/subscriptions/acknowledged',
+            'notifications/tasks',
+            'notifications/tools/list_changed'
+        ]);
+        expect(messages[1]!.params).toEqual({ _meta: { [SUBSCRIPTION_ID_META_KEY]: 9 }, taskId: 't1' });
+        await handler.close();
+    });
+
+    it('honors nothing for an extension the server does not advertise', async () => {
+        const handler = createMcpHandler(tasksFactory(false), { keepAliveMs: 0, listenExtensions: [tasksListen] });
+        const response = await handler.fetch(listenRequest(10, { toolsListChanged: true, taskIds: ['t1'] }));
+        const [ack] = (await readMessages(response, 1)) as { params: Record<string, unknown> }[];
+        expect(ack!.params['notifications']).toEqual({ toolsListChanged: true });
+        await handler.close();
+    });
+
+    it('drops extension fields when no extension is configured', async () => {
+        const handler = createMcpHandler(tasksFactory(true), { keepAliveMs: 0 });
+        const response = await handler.fetch(listenRequest(11, { toolsListChanged: true, taskIds: ['t1'] }));
+        const [ack] = (await readMessages(response, 1)) as { params: Record<string, unknown> }[];
+        expect(ack!.params['notifications']).toEqual({ toolsListChanged: true });
+        await handler.close();
+    });
+
+    it('refuses an extension that owns a core change notification or a method owned twice', () => {
+        const core: ListenExtension = { ...tasksListen, methods: ['notifications/tools/list_changed'] };
+        expect(() => createMcpHandler(tasksFactory(true), { listenExtensions: [core] })).toThrow(/already owned/);
+        expect(() => createMcpHandler(tasksFactory(true), { listenExtensions: [tasksListen, tasksListen] })).toThrow(/already owned/);
     });
 });
